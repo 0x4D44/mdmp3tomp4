@@ -3,6 +3,13 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::env;
 use std::io::{BufRead, Write, BufReader};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use glob::glob;
+
+// -------------------------------
+// CLI Enums
+// -------------------------------
 
 #[derive(Debug, Clone, Copy)]
 enum VisualizationType {
@@ -101,9 +108,13 @@ impl std::str::FromStr for VisualizationPosition {
     }
 }
 
+// -------------------------------
+// Config
+// -------------------------------
+
 #[derive(Debug, Clone)]
 struct VideoConfig {
-    image_path: String,
+    image_path: Option<String>,      // optional
     audio_path: String,
     output_path: String,
     viz_type: VisualizationType,
@@ -114,15 +125,19 @@ struct VideoConfig {
     height: u32,
     margin: u32,
     verbose: bool,
+
+    // Cover extraction controls
+    cover_from_audio: bool,
+    cover_out: Option<String>,       // only honored when processing a single file
 }
 
 impl Default for VideoConfig {
     fn default() -> Self {
         Self {
-            image_path: String::new(),
+            image_path: None,
             audio_path: String::new(),
             output_path: String::new(),
-            viz_type: VisualizationType::Both,
+            viz_type: VisualizationType::Waveform, // default changed to Wave
             duration: None,
             position: VisualizationPosition::Bottom,
             color_scheme: SpectrumColorScheme::Viridis,
@@ -130,104 +145,162 @@ impl Default for VideoConfig {
             height: 180,
             margin: 50,
             verbose: false,
+
+            cover_from_audio: false,
+            cover_out: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AppConfig {
+    // multiple inputs supported (expanded from glob)
+    inputs: Vec<String>,
+    out_dir: Option<String>,            // if set, write outputs here
+    // shared options for all
+    shared: SharedOpts,
+}
+
+#[derive(Debug, Clone)]
+struct SharedOpts {
+    image_path: Option<String>,
+    viz_type: VisualizationType,
+    duration: Option<f32>,
+    position: VisualizationPosition,
+    color_scheme: SpectrumColorScheme,
+    width: u32,
+    height: u32,
+    margin: u32,
+    verbose: bool,
+    cover_from_audio: bool,
+    cover_out: Option<String>,         // ignored when batch
+}
+
+impl Default for SharedOpts {
+    fn default() -> Self {
+        Self {
+            image_path: None,
+            viz_type: VisualizationType::Waveform, // default changed to Wave
+            duration: None,
+            position: VisualizationPosition::Bottom,
+            color_scheme: SpectrumColorScheme::Viridis,
+            width: 1280,
+            height: 180,
+            margin: 50,
+            verbose: false,
+            cover_from_audio: false,
+            cover_out: None,
         }
     }
 }
 
 fn print_usage() {
-    println!("Usage: mp3tomp4 <image_path> <audio_path> <output_path> [options]");
-    println!("\nOptions:");
-    println!("  --type <type>       Visualization type: 'wave', 'spectrum', or 'both' (default: both)");
-    println!("  --duration <sec>    Maximum duration in seconds (optional)");
-    println!("  --position <pos>    Position: 'top', 'bottom', 'left', 'right', 'center', or 'xy(x,y)' (default: bottom)");
-    println!("  --color <scheme>    Color scheme: 'rainbow', 'moreland', 'nebulae', 'fire', 'fiery', 'fruit', 'cool',");
-    println!("                      'magma', 'green', 'viridis', 'plasma', 'cividis', 'terrain' (default: viridis)");
-
-    println!("  --width <pixels>    Visualization width in pixels (default: 1280)");
-    println!("  --height <pixels>   Visualization height in pixels (default: 180)");
-    println!("  --margin <pixels>   Margin from edges in pixels (default: 50)");
-    println!("  --verbose           Enable detailed FFmpeg output");
+    println!("Usage: mp3tomp4 <audio_file_or_glob> [options]");
     println!("\nExamples:");
-    println!("  mp3tomp4 input.jpg music.mp3 output.mp4 --type both --position bottom --color fire");
-    println!("  mp3tomp4 image.png audio.wav video.mp4 --type spectrum --position right --color rgb(255,0,0) --width 360 --height 720");
-    println!(" ");
+    println!("  mp3tomp4 song.mp3                         # writes song.mp4 next to song.mp3");
+    println!("  mp3tomp4 \"*.mp3\"                         # batch converts all MP3s in cwd");
+    println!("  mp3tomp4 music/*.mp3 --out-dir out/       # batch to a different directory");
+    println!("  mp3tomp4 track.mp3 --image cover.jpg      # explicit image");
+    println!("  mp3tomp4 track.mp3 --cover-from-audio     # force embedded art");
+    println!("\nOptions:");
+    println!("  --image <path>        Optional explicit background image");
+    println!("  --cover-from-audio    Ignore --image and extract embedded cover art from the audio");
+    println!("  --cover-out <path>    Also save the extracted cover image (single input only)");
+    println!("  --out-dir <dir>       Write outputs to this directory (filenames still derived)");
+    println!("  --type <type>         'wave' (default), 'spectrum', or 'both'");
+    println!("  --duration <sec>      Max duration seconds (optional)");
+    println!("  --position <pos>      'top' | 'bottom' | 'left' | 'right' | 'center' | 'xy(x,y)' (default: bottom)");
+    println!("  --color <scheme>      'rainbow'|'moreland'|'nebulae'|'fire'|'fiery'|'fruit'|'cool'|'magma'|'green'|'viridis'|'plasma'|'cividis'|'terrain'");
+    println!("  --width <px>          Viz width (default 1280)");
+    println!("  --height <px>         Viz height (default 180)");
+    println!("  --margin <px>         Margin (default 50)");
+    println!("  --verbose             Show ffmpeg output");
+    println!();
 }
 
-fn parse_args() -> Result<Option<VideoConfig>, Box<dyn Error>> {
+fn parse_args() -> Result<Option<AppConfig>, Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
-    
-    if args.len() < 4 {
+
+    if args.len() < 2 {
         print_usage();
         return Ok(None);
     }
 
-    let mut config = VideoConfig {
-        image_path: args[1].clone(),
-        audio_path: args[2].clone(),
-        output_path: args[3].clone(),
-        ..Default::default()
-    };
+    let mut inputs: Vec<String> = Vec::new();
+    let glob_or_file = args[1].clone();
 
-    let mut i = 4;
+    // parse options
+    let mut shared = SharedOpts::default();
+    let mut out_dir: Option<String> = None;
+
+    let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--type" => {
+            "--image" => {
                 i += 1;
-                if i < args.len() {
-                    config.viz_type = args[i].parse()?;
-                }
-            },
-            "--duration" => {
+                if i < args.len() { shared.image_path = Some(args[i].clone()); }
+                else { return Err("--image requires a path".into()); }
+            }
+            "--cover-from-audio" => { shared.cover_from_audio = true; }
+            "--cover-out" => {
                 i += 1;
-                if i < args.len() {
-                    config.duration = Some(args[i].parse()?);
-                }
-            },
-            "--position" => {
+                if i < args.len() { shared.cover_out = Some(args[i].clone()); }
+                else { return Err("--cover-out requires a path".into()); }
+            }
+            "--out-dir" => {
                 i += 1;
-                if i < args.len() {
-                    config.position = args[i].parse()?;
-                }
-            },
-            "--color" => {
-                i += 1;
-                if i < args.len() {
-                    config.color_scheme = args[i].parse()?;
-                }
-            },
-            "--width" => {
-                i += 1;
-                if i < args.len() {
-                    config.width = args[i].parse()?;
-                }
-            },
-            "--height" => {
-                i += 1;
-                if i < args.len() {
-                    config.height = args[i].parse()?;
-                }
-            },
-            "--margin" => {
-                i += 1;
-                if i < args.len() {
-                    config.margin = args[i].parse()?;
-                }
-            },
-            "--verbose" => {
-                config.verbose = true;
-            },
+                if i < args.len() { out_dir = Some(args[i].clone()); }
+                else { return Err("--out-dir requires a directory path".into()); }
+            }
+            "--type" => { i += 1; if i < args.len() { shared.viz_type = args[i].parse()?; } }
+            "--duration" => { i += 1; if i < args.len() { shared.duration = Some(args[i].parse()?); } }
+            "--position" => { i += 1; if i < args.len() { shared.position = args[i].parse()?; } }
+            "--color" => { i += 1; if i < args.len() { shared.color_scheme = args[i].parse()?; } }
+            "--width" => { i += 1; if i < args.len() { shared.width = args[i].parse()?; } }
+            "--height" => { i += 1; if i < args.len() { shared.height = args[i].parse()?; } }
+            "--margin" => { i += 1; if i < args.len() { shared.margin = args[i].parse()?; } }
+            "--verbose" => { shared.verbose = true; }
             unknown => return Err(format!("Unknown argument: {}", unknown).into()),
         }
         i += 1;
     }
 
-    Ok(Some(config))
+    // Expand glob; if no match, use as literal file if exists; else error
+    let mut matched = false;
+    for entry in glob(&glob_or_file)? {
+        matched = true;
+        if let Ok(path) = entry {
+            if path.is_file() {
+                inputs.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    if !matched {
+        // treat as literal path
+        if Path::new(&glob_or_file).is_file() {
+            inputs.push(glob_or_file);
+        } else {
+            return Err(format!("No files matched pattern or file not found: {}", glob_or_file).into());
+        }
+    }
+
+    // if batch and --cover-out provided → ignore (single-file convenience)
+    if inputs.len() > 1 && shared.cover_out.is_some() {
+        eprintln!("Warning: --cover-out is ignored in batch mode (multiple inputs).");
+        shared.cover_out = None;
+    }
+
+    Ok(Some(AppConfig { inputs, out_dir, shared }))
 }
 
-// Helper function to get spectrum parameters based on orientation
+// -------------------------------
+// Spectrum helper fns
+// -------------------------------
+
 fn get_spectrum_params(pos: VisualizationPosition, width: u32, height: u32) -> (u32, u32, &'static str) {
     match pos {
-        VisualizationPosition::Left | VisualizationPosition::Right => 
+        VisualizationPosition::Left | VisualizationPosition::Right =>
             (height, width, "vertical"),
         _ => (width, height, "horizontal")
     }
@@ -236,7 +309,7 @@ fn get_spectrum_params(pos: VisualizationPosition, width: u32, height: u32) -> (
 fn get_filter_complex(config: &VideoConfig) -> String {
     // Common background scaling
     let base = "[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2[bg]";
-    
+
     match config.viz_type {
         VisualizationType::Waveform => {
             format!(
@@ -251,7 +324,7 @@ fn get_filter_complex(config: &VideoConfig) -> String {
         VisualizationType::Spectrum => {
             let (spec_width, spec_height, orientation) = get_spectrum_params(config.position, config.width, config.height);
             let spec_params = get_color_args(config.color_scheme, spec_width, spec_height, orientation);
-            
+
             format!(
                 "{}; \
                 [1:a]aformat=channel_layouts=mono,showspectrum={}[spec]; \
@@ -262,16 +335,17 @@ fn get_filter_complex(config: &VideoConfig) -> String {
         },
         VisualizationType::Both => {
             let gap = config.margin / 2; // Dynamic gap based on margin
-            let (wave_height, spec_height) = match config.position {
+            let (wave_height, _half_spec_h) = match config.position {
                 VisualizationPosition::Left | VisualizationPosition::Right => {
                     (config.width / 2, config.width / 2) // For vertical layout
                 },
                 _ => (config.height / 2, config.height / 2) // For horizontal layout
             };
-            
-            let (spec_width, spec_height, orientation) = get_spectrum_params(config.position, config.width, spec_height);
+
+            let (spec_width, spec_height, orientation) =
+                get_spectrum_params(config.position, config.width, wave_height);
             let spec_params = get_color_args(config.color_scheme, spec_width, spec_height, orientation);
-            
+
             let (wave_pos, spec_pos) = match config.position {
                 VisualizationPosition::Bottom => (
                     format!("x=(W-w)/2:y=H-h-{}-{}", spec_height + gap, config.margin),
@@ -298,7 +372,7 @@ fn get_filter_complex(config: &VideoConfig) -> String {
                     format!("x={}:y={}+{}", x, y + wave_height, gap)
                 )
             };
-            
+
             format!(
                 "{}; \
                 [1:a]aformat=channel_layouts=mono,showwaves=s={}x{}:mode=line:rate=25:colors=white[wave]; \
@@ -323,7 +397,7 @@ fn get_color_args(scheme: SpectrumColorScheme, width: u32, height: u32, orientat
         width, height,
         if orientation == "vertical" { "1" } else { "0" }
     );
-    
+
     let color = match scheme {
         SpectrumColorScheme::Rainbow => "rainbow",
         SpectrumColorScheme::Moreland => "moreland",
@@ -339,35 +413,230 @@ fn get_color_args(scheme: SpectrumColorScheme, width: u32, height: u32, orientat
         SpectrumColorScheme::Cividis => "cividis",
         SpectrumColorScheme::Terrain => "terrain"
     };
-    
+
     format!("{}:color={}", base_args, color)
 }
 
 fn get_position_overlay(pos: VisualizationPosition, margin: u32) -> String {
     match pos {
-        VisualizationPosition::Top => 
+        VisualizationPosition::Top =>
             format!("x=(W-w)/2:y={}", margin),
-        VisualizationPosition::Bottom => 
+        VisualizationPosition::Bottom =>
             format!("x=(W-w)/2:y=H-h-{}", margin),
-        VisualizationPosition::Left => 
+        VisualizationPosition::Left =>
             format!("x={}:y=(H-h)/2", margin),
-        VisualizationPosition::Right => 
+        VisualizationPosition::Right =>
             format!("x=W-w-{}:y=(H-h)/2", margin),
-        VisualizationPosition::Center => 
+        VisualizationPosition::Center =>
             "x=(W-w)/2:y=(H-h)/2".to_string(),
-        VisualizationPosition::Custom(x, y) => 
+        VisualizationPosition::Custom(x, y) =>
             format!("x={}:y={}", x, y)
     }
 }
 
-fn create_video(config: VideoConfig) -> Result<(), Box<dyn Error>> {
-    // Validate input files
-    if !Path::new(&config.image_path).exists() {
-        return Err(format!("Image file not found: {}", config.image_path).into());
+// -------------------------------
+// Cover extraction helpers
+// -------------------------------
+
+fn ext_from_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        _ => "bin",
     }
+}
+
+fn temp_cover_path_with_ext(ext: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    Ok(env::temp_dir().join(format!("cover_{}_{}.{}", std::process::id(), ts, ext)))
+}
+
+fn extract_cover_via_id3(audio_path: &str, save_to: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
+    let tag = id3::Tag::read_from_path(audio_path)?;
+    let mut chosen = None;
+    for p in tag.pictures() {
+        if p.picture_type == id3::frame::PictureType::CoverFront {
+            chosen = Some(p.clone());
+            break;
+        }
+        if chosen.is_none() {
+            chosen = Some(p.clone());
+        }
+    }
+    let pic = chosen.ok_or("No embedded picture found in ID3")?;
+    let ext = ext_from_mime(&pic.mime_type);
+    let out = if let Some(dst) = save_to {
+        PathBuf::from(dst)
+    } else {
+        temp_cover_path_with_ext(ext)?
+    };
+    std::fs::write(&out, &pic.data)?;
+    Ok(out)
+}
+
+fn extract_cover_via_ffmpeg(audio_path: &str, save_to: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
+    // Probe to guess extension
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:attached_pic",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            audio_path,
+        ])
+        .output()?;
+
+    let codec = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    if codec.is_empty() {
+        return Err("No attached picture stream found".into());
+    }
+
+    let ext = match codec.as_str() {
+        "mjpeg" => "jpg",
+        "png" => "png",
+        "webp" => "webp",
+        other => {
+            eprintln!("Unknown attached_pic codec '{}', defaulting to .bin", other);
+            "bin"
+        }
+    };
+
+    let out = if let Some(dst) = save_to {
+        PathBuf::from(dst)
+    } else {
+        temp_cover_path_with_ext(ext)?
+    };
+
+    // Extract the attached picture
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i", audio_path,
+            "-an",
+            "-map", "0:v:0",
+            "-c", "copy",
+            out.to_str().ok_or("Invalid cover output path")?,
+        ])
+        .status()?;
+
+    if !status.success() {
+        return Err("ffmpeg failed to extract attached picture".into());
+    }
+    Ok(out)
+}
+
+/// Attempts to extract cover art to a temp file (or user path if provided).
+/// Returns the path to the extracted file.
+fn extract_cover_to_file(audio_path: &str, optional_out: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
+    match extract_cover_via_id3(audio_path, optional_out) {
+        Ok(p) => Ok(p),
+        Err(e1) => {
+            // fallback to ffmpeg if available
+            let ff_ok = Command::new("ffmpeg")
+                .arg("-version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok();
+            if ff_ok {
+                extract_cover_via_ffmpeg(audio_path, optional_out).map_err(|e2| {
+                    format!("Cover not found via ID3 ({e1}); ffmpeg fallback also failed: {e2}").into()
+                })
+            } else {
+                Err(format!("Cover not found via ID3 ({e1}) and ffmpeg not available for fallback").into())
+            }
+        }
+    }
+}
+
+// -------------------------------
+// Thumbnail helper
+// -------------------------------
+
+fn write_thumbnail(
+    image_input_path: &str,
+    audio_path: &str,
+    output_video_path: &str,
+    verbose: bool,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    use std::ffi::OsStr;
+
+    let audio_stem = std::path::Path::new(audio_path)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .ok_or("Invalid audio filename")?;
+
+    // Put the thumbnail in the same dir as the .mp4 (handles --out-dir too)
+    let out_dir = std::path::Path::new(output_video_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+
+    // Prefer PNG only if the source is a PNG; otherwise use JPG (YouTube-friendly)
+    let src_ext = std::path::Path::new(image_input_path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let want_ext = if src_ext == "png" { "png" } else { "jpg" };
+    let dest = out_dir.join(format!("{}.{}", audio_stem, want_ext));
+
+    // If we already have the right format, just copy; else transcode via ffmpeg
+    if (src_ext == "jpg" || src_ext == "jpeg" || src_ext == "png") && src_ext == want_ext {
+        if std::path::Path::new(image_input_path) != dest {
+            std::fs::copy(image_input_path, &dest)?;
+        }
+    } else {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-y", "-i", image_input_path, "-frames:v", "1"]);
+        if want_ext == "jpg" {
+            // good quality jpeg for thumbnails
+            cmd.args(["-q:v", "2"]);
+        }
+        cmd.arg(dest.to_str().ok_or("Bad thumbnail output path")?);
+
+        if !verbose {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+
+        let status = cmd.status()?;
+        if !status.success() {
+            return Err("Failed to write thumbnail via ffmpeg".into());
+        }
+    }
+
+    println!("Thumbnail saved: {}", dest.display());
+    Ok(dest)
+}
+
+// -------------------------------
+// Video creation (uses cover if needed)
+// -------------------------------
+
+fn create_video(config: VideoConfig) -> Result<(), Box<dyn Error>> {
+    // Validate audio first
     if !Path::new(&config.audio_path).exists() {
         return Err(format!("Audio file not found: {}", config.audio_path).into());
     }
+
+    // Resolve image path
+    let mut temp_cover_to_delete: Option<PathBuf> = None;
+    let image_input_path: String = {
+        let need_extract = config.cover_from_audio
+            || config.image_path.as_ref().map_or(true, |p| !Path::new(p).exists());
+
+        if need_extract {
+            let out_hint = config.cover_out.as_deref();
+            let p = extract_cover_to_file(&config.audio_path, out_hint)?;
+            if out_hint.is_none() { temp_cover_to_delete = Some(p.clone()); }
+            p.to_string_lossy().into_owned()
+        } else {
+            // image_path exists and we are not forcing cover-from-audio
+            config.image_path.clone().unwrap()
+        }
+    };
 
     // Get audio duration
     let duration = Command::new("ffprobe")
@@ -390,14 +659,14 @@ fn create_video(config: VideoConfig) -> Result<(), Box<dyn Error>> {
 
     println!("Creating temporary file at: {}", temp_video_path);
 
-    // Generate the filter complex string using our new function
+    // Generate the filter complex string
     let filter = get_filter_complex(&config);
 
     println!("Step 1: Creating visualization video...");
 
     let mut step1 = Command::new("ffmpeg");
     step1.arg("-y")
-         .arg("-i").arg(&config.image_path)
+         .arg("-i").arg(&image_input_path)
          .arg("-i").arg(&config.audio_path)
          .arg("-filter_complex").arg(&filter)
          .arg("-c:v").arg("libx264")
@@ -413,7 +682,7 @@ fn create_video(config: VideoConfig) -> Result<(), Box<dyn Error>> {
     }
 
     let mut step1_child = step1.spawn()?;
-    
+
     if !config.verbose {
         let mut had_error = false;
         if let Some(stderr) = step1_child.stderr.take() {
@@ -494,15 +763,26 @@ fn create_video(config: VideoConfig) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Clean up temporary file
+    // --- NEW: emit thumbnail next to the .mp4 ---
+    let _thumb_path = write_thumbnail(
+        &image_input_path,
+        &config.audio_path,
+        &config.output_path,
+        config.verbose,
+    )?;
+
+    // Clean up temporary file(s)
     if Path::new(temp_video_path).exists() {
         let _ = std::fs::remove_file(temp_video_path);
+    }
+    if let Some(p) = temp_cover_to_delete {
+        let _ = std::fs::remove_file(p);
     }
 
     // Verify the output file
     if let Ok(metadata) = std::fs::metadata(&config.output_path) {
         if metadata.len() > 0 {
-            println!("\nVideo created successfully! Output size: {} bytes", metadata.len());
+            println!("\nVideo created successfully! Output: {} ({} bytes)", config.output_path, metadata.len());
             Ok(())
         } else {
             Err("Output file was created but has zero size".into())
@@ -512,6 +792,52 @@ fn create_video(config: VideoConfig) -> Result<(), Box<dyn Error>> {
     }
 }
 
+// -------------------------------
+// Batch runner
+// -------------------------------
+
+fn derive_output_path(audio_path: &str, out_dir: &Option<String>) -> Result<String, Box<dyn Error>> {
+    let mut out = PathBuf::from(audio_path);
+    out.set_extension("mp4");
+    if let Some(dir) = out_dir {
+        let file = out.file_name().ok_or("Invalid audio file name")?.to_owned();
+        let mut dst = PathBuf::from(dir);
+        if !dst.exists() {
+            std::fs::create_dir_all(&dst)?;
+        }
+        dst.push(file);
+        Ok(dst.to_string_lossy().into_owned())
+    } else {
+        Ok(out.to_string_lossy().into_owned())
+    }
+}
+
+fn run_batch(app: AppConfig) -> Result<(), Box<dyn Error>> {
+    for audio in app.inputs {
+        let output = derive_output_path(&audio, &app.out_dir)?;
+        println!("Processing: {}", audio);
+
+        let cfg = VideoConfig {
+            image_path: app.shared.image_path.clone(),
+            audio_path: audio.clone(),
+            output_path: output,
+            viz_type: app.shared.viz_type,
+            duration: app.shared.duration,
+            position: app.shared.position,
+            color_scheme: app.shared.color_scheme,
+            width: app.shared.width,
+            height: app.shared.height,
+            margin: app.shared.margin,
+            verbose: app.shared.verbose,
+            cover_from_audio: app.shared.cover_from_audio,
+            cover_out: app.shared.cover_out.clone(), // ignored if batch
+        };
+
+        create_video(cfg)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     // Check if ffmpeg is available
     if let Err(_) = Command::new("ffmpeg").arg("-version").output() {
@@ -519,12 +845,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     match parse_args()? {
-        Some(config) => create_video(config)?,
+        Some(app) => run_batch(app)?,
         None => return Ok(()),
     }
 
     Ok(())
-}                    
+}
+
+// -------------------------------
+// Tests
+// -------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -532,9 +862,8 @@ mod tests {
     use std::fs;
     use std::process::Stdio;
     use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use serde_json;
     use serial_test::serial;
 
@@ -569,12 +898,12 @@ mod tests {
         image_path: String,
         audio_path: String,
         output_path: String,
-        cleaned_up: bool,  // Add this field to track cleanup state
+        cleaned_up: bool,
     }
 
     impl TestFiles {
         fn new() -> Result<Self, TestError> {
-            // Generate a unique test directory name using process ID and timestamp
+            // Unique test dir
             let test_dir = format!("test_files_{}_{}",
                 std::process::id(),
                 SystemTime::now()
@@ -582,28 +911,22 @@ mod tests {
                     .unwrap_or_default()
                     .as_secs()
             );
-            
-            println!("Creating test directory: {}", test_dir);
-            
-            // Create test directory and all parent directories
+
             fs::create_dir_all(&test_dir)
-                .map_err(|e| TestError::Io(e))?;
-            
+                .map_err(TestError::Io)?;
+
             let files = TestFiles {
                 image_path: format!("{}/test_image.png", test_dir),
                 audio_path: format!("{}/test_audio.mp3", test_dir),
                 output_path: format!("{}/test_output.mp4", test_dir),
-                cleaned_up: false,  // Initialize as not cleaned up
+                cleaned_up: false,
             };
-            
-            println!("Generating test files...");
+
             files.generate_test_files()?;
             files.verify_files()?;
-            println!("Test files generated and verified successfully");
-            
             Ok(files)
         }
-    
+
         fn cleanup(&mut self) {
             if !self.cleaned_up {
                 if let Some(test_dir) = Path::new(&self.image_path).parent() {
@@ -614,9 +937,9 @@ mod tests {
                 self.cleaned_up = true;
             }
         }
-    
+
         fn generate_test_files(&self) -> Result<(), TestError> {
-            // Generate test image
+            // Image
             let status = Command::new("ffmpeg")
                 .arg("-y")
                 .arg("-f").arg("lavfi")
@@ -626,13 +949,12 @@ mod tests {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .map_err(|e| TestError::Io(e))?;
-
+                .map_err(TestError::Io)?;
             if !status.success() {
                 return Err(TestError::Ffmpeg("Failed to generate test image".into()));
             }
 
-            // Generate test audio
+            // Audio (no cover—tests that pass an explicit image will use it)
             let status = Command::new("ffmpeg")
                 .arg("-y")
                 .arg("-f").arg("lavfi")
@@ -642,8 +964,7 @@ mod tests {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .map_err(|e| TestError::Io(e))?;
-
+                .map_err(TestError::Io)?;
             if !status.success() {
                 return Err(TestError::Ffmpeg("Failed to generate test audio".into()));
             }
@@ -662,7 +983,7 @@ mod tests {
                     ));
                 }
                 let metadata = fs::metadata(path)
-                    .map_err(|e| TestError::Io(e))?;
+                    .map_err(TestError::Io)?;
                 println!("{} file size: {} bytes", file_type, metadata.len());
             }
             Ok(())
@@ -676,18 +997,15 @@ mod tests {
     }
 
     fn validate_video_file(path: &str) -> Result<VideoValidation, TestError> {
-        // Add delay to ensure file is fully written
+        // Delay to ensure file closed
         thread::sleep(Duration::from_secs(1));
-        
-        // Verify file exists and has size
+
+        // Verify file exists/size
         let metadata = fs::metadata(path)
             .map_err(|e| TestError::Validation(format!("Failed to get file metadata: {}", e)))?;
-            
         if metadata.len() == 0 {
             return Err(TestError::Validation("Output file has zero size".into()));
         }
-
-        println!("Probing file: {} (size: {} bytes)", path, metadata.len());
 
         let output = Command::new("ffprobe")
             .arg("-v").arg("error")
@@ -696,18 +1014,16 @@ mod tests {
             .arg("-of").arg("json")
             .arg(path)
             .output()
-            .map_err(|e| TestError::Io(e))?;
-    
+            .map_err(TestError::Io)?;
+
         if !output.status.success() {
             println!("FFprobe stderr: {}", String::from_utf8_lossy(&output.stderr));
             return Err(TestError::Ffmpeg("FFprobe command failed".into()));
         }
-    
-        println!("FFprobe output: {}", String::from_utf8_lossy(&output.stdout));
-    
+
         let probe_output: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|e| TestError::Validation(format!("JSON parse error: {}", e)))?;
-        
+
         let mut validation = VideoValidation {
             has_video: false,
             has_audio: false,
@@ -715,7 +1031,7 @@ mod tests {
             video_codec: String::new(),
             audio_codec: String::new(),
         };
-    
+
         if let Some(streams) = probe_output.get("streams").and_then(|s| s.as_array()) {
             for stream in streams {
                 if let Some(codec_type) = stream.get("codec_type").and_then(|t| t.as_str()) {
@@ -737,119 +1053,29 @@ mod tests {
                 }
             }
         }
-    
+
         if let Some(format) = probe_output.get("format") {
             if let Some(duration) = format.get("duration").and_then(|d| d.as_str()) {
                 validation.duration = duration.parse().unwrap_or(0.0);
             }
         }
-    
-        println!("Validation results: {:?}", validation);
+
         Ok(validation)
     }
 
-    #[test]
-    fn test_command_line_parsing() -> Result<(), Box<dyn Error>> {
-        // Test minimal args
-        let args = vec![
-            "program".to_string(),
-            "input.jpg".to_string(),
-            "audio.mp3".to_string(),
-            "output.mp4".to_string(),
-        ];
-
-        let config = parse_args_with_args(&args)?;
-        assert!(config.is_some());
-        if let Some(config) = config {
-            assert_eq!(config.image_path, "input.jpg");
-            assert_eq!(config.audio_path, "audio.mp3");
-            assert_eq!(config.output_path, "output.mp4");
-        }
-
-        // Test all options
-        let args = vec![
-            "program".to_string(),
-            "input.jpg".to_string(),
-            "audio.mp3".to_string(),
-            "output.mp4".to_string(),
-            "--type".to_string(), "spectrum".to_string(),
-            "--position".to_string(), "right".to_string(),
-            "--color".to_string(), "fire".to_string(),
-            "--width".to_string(), "360".to_string(),
-            "--height".to_string(), "720".to_string(),
-            "--margin".to_string(), "30".to_string(),
-            "--verbose".to_string(),
-        ];
-
-        let config = parse_args_with_args(&args)?;
-        assert!(config.is_some());
-        if let Some(config) = config {
-            assert_eq!(config.image_path, "input.jpg");
-            assert_eq!(config.audio_path, "audio.mp3");
-            assert_eq!(config.output_path, "output.mp4");
-            matches!(config.viz_type, VisualizationType::Spectrum);
-            matches!(config.position, VisualizationPosition::Right);
-            matches!(config.color_scheme, SpectrumColorScheme::Fire);
-            assert_eq!(config.width, 360);
-            assert_eq!(config.height, 720);
-            assert_eq!(config.margin, 30);
-            assert!(config.verbose);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_invalid_arguments() -> Result<(), Box<dyn Error>> {
-        // Test invalid visualization type
-        let args = vec![
-            "program".to_string(),
-            "input.jpg".to_string(),
-            "audio.mp3".to_string(),
-            "output.mp4".to_string(),
-            "--type".to_string(),
-            "invalid".to_string(),
-        ];
-        assert!(parse_args_with_args(&args).is_err());
-
-        // Test invalid position
-        let args = vec![
-            "program".to_string(),
-            "input.jpg".to_string(),
-            "audio.mp3".to_string(),
-            "output.mp4".to_string(),
-            "--position".to_string(),
-            "invalid".to_string(),
-        ];
-        assert!(parse_args_with_args(&args).is_err());
-
-        // Test invalid color scheme
-        let args = vec![
-            "program".to_string(),
-            "input.jpg".to_string(),
-            "audio.mp3".to_string(),
-            "output.mp4".to_string(),
-            "--color".to_string(),
-            "invalid".to_string(),
-        ];
-        assert!(parse_args_with_args(&args).is_err());
-
-        Ok(())
-    }
+    // ---------------- Tests ----------------
 
     #[test]
     #[serial]
     fn test_spectrum_visualization() -> Result<(), Box<dyn Error>> {
         let mut files = TestFiles::new()?;
-        println!("Test files created successfully");
-        
-        // Create parent directory for output file if it doesn't exist
+
         if let Some(parent) = Path::new(&files.output_path).parent() {
             fs::create_dir_all(parent)?;
         }
-        
+
         let config = VideoConfig {
-            image_path: files.image_path.clone(),
+            image_path: Some(files.image_path.clone()),
             audio_path: files.audio_path.clone(),
             output_path: files.output_path.clone(),
             viz_type: VisualizationType::Spectrum,
@@ -860,27 +1086,22 @@ mod tests {
             height: 180,
             margin: 50,
             verbose: true,
+            cover_from_audio: false,
+            cover_out: None,
         };
 
-        println!("Starting create_video with config: {:?}", config);
         create_video(config)?;
-        println!("Video creation completed");
-        
+
         thread::sleep(Duration::from_secs(1));
-        
-        // Prevent cleanup until after validation
+
         let validation = validate_video_file(&files.output_path)?;
-        println!("Video validation completed: {:?}", validation);
-        
         assert!(validation.has_video, "Video stream not found");
         assert!(validation.has_audio, "Audio stream not found");
         assert!(validation.duration > 0.0, "Duration should be greater than 0");
         assert!(!validation.video_codec.is_empty(), "Video codec should not be empty");
         assert!(!validation.audio_codec.is_empty(), "Audio codec should not be empty");
 
-        // Now we can cleanup
         files.cleanup();
-        
         Ok(())
     }
 
@@ -888,13 +1109,13 @@ mod tests {
     #[serial]
     fn test_both_visualizations() -> Result<(), Box<dyn Error>> {
         let mut files = TestFiles::new()?;
-        
+
         if let Some(parent) = Path::new(&files.output_path).parent() {
             fs::create_dir_all(parent)?;
         }
-        
+
         let config = VideoConfig {
-            image_path: files.image_path.clone(),
+            image_path: Some(files.image_path.clone()),
             audio_path: files.audio_path.clone(),
             output_path: files.output_path.clone(),
             viz_type: VisualizationType::Both,
@@ -905,27 +1126,22 @@ mod tests {
             height: 360,
             margin: 50,
             verbose: true,
+            cover_from_audio: false,
+            cover_out: None,
         };
 
-        println!("Starting create_video with config: {:?}", config);
         create_video(config)?;
-        println!("Video creation completed");
-        
+
         thread::sleep(Duration::from_secs(1));
-        
-        // Prevent cleanup until after validation
+
         let validation = validate_video_file(&files.output_path)?;
-        println!("Video validation completed: {:?}", validation);
-        
         assert!(validation.has_video, "Video stream not found");
         assert!(validation.has_audio, "Audio stream not found");
         assert!(validation.duration > 0.0, "Duration should be greater than 0");
         assert!(!validation.video_codec.is_empty(), "Video codec should not be empty");
         assert!(!validation.audio_codec.is_empty(), "Audio codec should not be empty");
 
-        // Now we can cleanup
         files.cleanup();
-        
         Ok(())
     }
 
@@ -933,14 +1149,13 @@ mod tests {
     #[serial]
     fn test_waveform_visualization() -> Result<(), Box<dyn Error>> {
         let mut files = TestFiles::new()?;
-        println!("Test files created successfully");
-        
+
         if let Some(parent) = Path::new(&files.output_path).parent() {
             fs::create_dir_all(parent)?;
         }
-        
+
         let config = VideoConfig {
-            image_path: files.image_path.clone(),
+            image_path: Some(files.image_path.clone()),
             audio_path: files.audio_path.clone(),
             output_path: files.output_path.clone(),
             viz_type: VisualizationType::Waveform,
@@ -951,96 +1166,22 @@ mod tests {
             height: 180,
             margin: 50,
             verbose: true,
+            cover_from_audio: false,
+            cover_out: None,
         };
 
-        println!("Starting create_video with config: {:?}", config);
         create_video(config)?;
-        println!("Video creation completed");
-        
+
         thread::sleep(Duration::from_secs(1));
-        
-        // Prevent cleanup until after validation
+
         let validation = validate_video_file(&files.output_path)?;
-        println!("Video validation completed: {:?}", validation);
-        
         assert!(validation.has_video, "Video stream not found");
         assert!(validation.has_audio, "Audio stream not found");
         assert!(validation.duration > 0.0, "Duration should be greater than 0");
         assert!(!validation.video_codec.is_empty(), "Video codec should not be empty");
         assert!(!validation.audio_codec.is_empty(), "Audio codec should not be empty");
 
-        // Now we can cleanup
         files.cleanup();
-        
         Ok(())
     }
-    
-    // Helper function for command-line parsing tests
-    fn parse_args_with_args(args: &[String]) -> Result<Option<VideoConfig>, Box<dyn Error>> {
-        if args.len() < 4 {
-            return Ok(None);
-        }
-
-        let mut config = VideoConfig {
-            image_path: args[1].clone(),
-            audio_path: args[2].clone(),
-            output_path: args[3].clone(),
-            ..Default::default()
-        };
-
-        let mut i = 4;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--type" => {
-                    i += 1;
-                    if i < args.len() {
-                        config.viz_type = args[i].parse()?;
-                    }
-                },
-                "--position" => {
-                    i += 1;
-                    if i < args.len() {
-                        config.position = args[i].parse()?;
-                    }
-                },
-                "--color" => {
-                    i += 1;
-                    if i < args.len() {
-                        config.color_scheme = args[i].parse()?;
-                    }
-                },
-                "--width" => {
-                    i += 1;
-                    if i < args.len() {
-                        config.width = args[i].parse()?;
-                    }
-                },
-                "--height" => {
-                    i += 1;
-                    if i < args.len() {
-                        config.height = args[i].parse()?;
-                    }
-                },
-                "--margin" => {
-                    i += 1;
-                    if i < args.len() {
-                        config.margin = args[i].parse()?;
-                    }
-                },
-                "--verbose" => {
-                    config.verbose = true;
-                },
-                "--duration" => {
-                    i += 1;
-                    if i < args.len() {
-                        config.duration = Some(args[i].parse()?);
-                    }
-                },
-                unknown => return Err(format!("Unknown argument: {}", unknown).into()),
-            }
-            i += 1;
-        }
-
-        Ok(Some(config))
-    }
-}                    
+}
